@@ -1,0 +1,6 @@
+services:
+  app:
+    build: .
+    image: olympic-participation-tracker
+    ports:
+      - "80:80"

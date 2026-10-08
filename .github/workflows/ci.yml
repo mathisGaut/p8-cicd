@@ -1,0 +1,116 @@
+# Pipeline CI générique : un seul fichier pour l'appli Angular ET l'appli Java.
+# Phase couverte : tests. Les projets présents dans le dépôt sont détectés automatiquement
+# (racine ou sous-dossiers) et testés en parallèle via une matrice.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Droits minimaux du GITHUB_TOKEN ("checks" sert à publier le rapport de tests)
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+env:
+  NODE_VERSION: '20'
+  JAVA_VERSION: '21'
+
+jobs:
+  # Job 1 : détecte les projets Angular / Java et construit la matrice du job de test
+  detect:
+    name: Détection des projets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          entries=""
+          for dir in . */; do
+            dir="${dir%/}"
+            if [ -f "$dir/package.json" ] && grep -q '"@angular/core"' "$dir/package.json"; then
+              entries="$entries{\"dir\":\"$dir\",\"type\":\"angular\"},"
+            elif [ -f "$dir/build.gradle" ] && [ -f "$dir/gradlew" ]; then
+              entries="$entries{\"dir\":\"$dir\",\"type\":\"java\"},"
+            fi
+          done
+          if [ -z "$entries" ]; then
+            echo "::error::Aucun projet Angular ou Gradle/Java détecté"
+            exit 1
+          fi
+          echo "matrix={\"include\":[${entries%,}]}" >> "$GITHUB_OUTPUT"
+
+  # Job 2 : tests, un run par projet détecté ; les étapes sont choisies via des conditions (if:)
+  test:
+    name: Tests (${{ matrix.type }})
+    needs: detect
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Angular ---
+      - name: Installer Node.js (cache npm)
+        if: matrix.type == 'angular'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.dir }}/package-lock.json
+
+      - name: Installer les dépendances
+        if: matrix.type == 'angular'
+        run: npm ci
+
+      - name: Lancer les tests Angular
+        if: matrix.type == 'angular'
+        run: npm test
+
+      # --- Java / Gradle ---
+      - name: Installer le JDK
+        if: matrix.type == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Configurer Gradle (cache des dépendances)
+        if: matrix.type == 'java'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: ${{ matrix.dir }}
+
+      - name: Lancer les tests Java
+        if: matrix.type == 'java'
+        run: |
+          chmod +x gradlew
+          ./gradlew clean test --no-daemon
+
+      # --- Rapport (JUnit XML) intégré à GitHub ---
+      - name: Publier le rapport de tests
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Rapport de tests (${{ matrix.type }})
+          working-directory: ${{ matrix.dir }}
+          path: ${{ matrix.type == 'angular' && 'reports/**/*.xml' || 'build/test-results/test/*.xml' }}
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Archiver les rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.type }}
+          path: ${{ matrix.dir }}/${{ matrix.type == 'angular' && 'reports' || 'build/reports/tests/test' }}
+          if-no-files-found: warn
