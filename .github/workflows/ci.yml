@@ -1,21 +1,23 @@
 # Pipeline CI générique : un seul fichier pour l'appli Angular ET l'appli Java.
-# Phase couverte : tests. Les projets présents dans le dépôt sont détectés automatiquement
+# Phases couvertes : tests, puis build et publication des images Docker sur ghcr.io. Les projets présents dans le dépôt sont détectés automatiquement
 # (racine ou sous-dossiers) et testés en parallèle via une matrice.
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**']
   pull_request:
     branches: [main]
 
-# Droits minimaux du GITHUB_TOKEN ("checks" sert à publier le rapport de tests)
+# Droits minimaux du GITHUB_TOKEN ("checks" : rapport de tests, "packages" : push sur ghcr.io)
 permissions:
   contents: read
   checks: write
   pull-requests: write
+  packages: write
 
 env:
+  REGISTRY: ghcr.io
   NODE_VERSION: '20'
   JAVA_VERSION: '21'
 
@@ -114,3 +116,73 @@ jobs:
           name: test-results-${{ matrix.type }}
           path: ${{ matrix.dir }}/${{ matrix.type == 'angular' && 'reports' || 'build/reports/tests/test' }}
           if-no-files-found: warn
+
+  # Job 3 : build de l'image Docker de chaque projet, vérification, puis publication sur ghcr.io
+  # (uniquement sur push : pas de publication depuis une pull request)
+  build:
+    name: Build Docker (${{ matrix.type }})
+    needs: [detect, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag lisible : <branche>-<sha court>, ex. main-1a2b3c4 (le nom d'image doit être en minuscules)
+      - name: Calculer le nom et les tags de l'image
+        id: meta
+        run: |
+          branch="$(echo "$GITHUB_REF_NAME" | tr '/' '-' | tr 'A-Z' 'a-z')"
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}/${{ matrix.type }}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Connexion à ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 1) Build local (sans push) pour pouvoir tester l'image
+      - name: Construire l'image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.dir }}
+          load: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.type }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.type }}
+
+      # 2) Vérification que l'image est fonctionnelle
+      - name: Vérifier l'image Angular (nginx sert l'application)
+        if: matrix.type == 'angular'
+        run: |
+          docker run -d --name smoke -p 8080:80 "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:8080/ | grep -qi '<app-root' && exit 0
+            sleep 2
+          done
+          docker logs smoke
+          echo "::error::L'image Angular ne sert pas l'application"
+          exit 1
+
+      # L'application Java a besoin de PostgreSQL pour démarrer : on vérifie ici le contenu de l'image
+      - name: Vérifier l'image Java (JAR Spring Boot présent, JRE 21)
+        if: matrix.type == 'java'
+        run: |
+          image="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker run --rm --entrypoint sh "$image" -c 'test -s /app/app.jar && java -version'
+
+      # 3) Publication (le cache de l'étape 1 évite de tout reconstruire)
+      - name: Publier l'image sur ghcr.io
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.dir }}
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.type }}
