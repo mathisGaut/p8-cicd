@@ -1,5 +1,6 @@
-# Résultats de tests générés par run-tests.sh
+# Résultats de tests générés (run-tests.sh, npm test)
 test-results/
+angular-app/reports/
 
 # Fichiers système / éditeurs
 .DS_Store
