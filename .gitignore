@@ -1,0 +1,6 @@
+# Résultats de tests générés par run-tests.sh
+test-results/
+
+# Fichiers système / éditeurs
+.DS_Store
+.idea/
